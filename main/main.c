@@ -144,9 +144,69 @@ static void eth_event_handler(void* arg, esp_event_base_t event_base, int32_t ev
     }
 }
 
+void set_leds(uint8_t sequence, uint8_t physical, uint16_t universe, uint8_t* data, uint16_t length) {
+     printf("Art-Net sequence %u, physical %u, universe %u, length %u\r\n", sequence, physical, universe, length);
+
+    if (length > sizeof(led_data)) {
+        length = sizeof(led_data);
+    }
+
+    memcpy(led_data, data, length);
+
+    for (int i = 0; i < sizeof(led_data) / 3; i++) {
+        uint8_t r           = led_data[i * 3 + 0];
+        uint8_t g           = led_data[i * 3 + 1];
+        led_data[i * 3 + 0] = g;
+        led_data[i * 3 + 1] = r;
+    }
+
+    ledstrip_send(&ledstrip, led_data, sizeof(led_data));
+
+}
+
 #define ARTNET_PORT 6454
 
-const esp_netif_ip_info_t* ip_info;
+typedef enum artnet_op {
+    ARTNET_OP_POLL = 0x2000,
+    ARTNET_OP_POLL_REPLY = 0x2100,
+    ARTNET_OP_DIAG_DATA = 0x2300,
+    ARTNET_OP_COMMAND = 0x2400,
+    ARTNET_OP_DATA_REQUEST = 0x2700,
+    ARTNET_OP_DATA_REPLY = 0x2800,
+    ARTNET_OP_OP_OUTPUT = 0x5000,
+    ARTNET_OP_NZS = 0x5100,
+    ARTNET_OP_SYNC = 0x5200,
+    ARTNET_OP_ADDRESS = 0x6000,
+    ARTNET_OP_INPUT = 0x7000,
+    ARTNET_OP_TOD_REQUEST = 0x8000,
+    ARTNET_OP_TOD_DATA = 0x8100,
+    ARTNET_OP_TOD_CONTROL = 0x8200,
+    ARTNET_OP_RDM = 0x8300,
+    ARTNET_OP_RDM_SUB = 0x8400,
+    ARTNET_OP_VIDEO_SETUP = 0xA010,
+    ARTNET_OP_VIDEO_PALETTE = 0xA020,
+    ARTNET_OP_VIDEO_DATA = 0xA040,
+    ARTNET_OP_MAC_MASTER = 0xF000,
+    ARTNET_OP_MAC_SLAVE = 0xF100,
+    ARTNET_OP_FIRMWARE_MASTER = 0xF200,
+    ARTNET_OP_FIRMWARE_REPLY = 0xF300,
+    ARTNET_OP_FILE_TN_MASTER = 0xF400,
+    ARTNET_OP_FILE_FN_MASTER = 0xF500,
+    ARTNET_OP_FILE_FN_REPLY = 0xF600,
+    ARTNET_OP_IP_PROG_REPLY = 0xF900,
+    ARTNET_OP_MEDIA = 0x9000,
+    ARTNET_OP_MEDIA_PATCH = 0x9100,
+    ARTNET_OP_MEDIA_CONTROL = 0x9200,
+    ARTNET_OP_MEDIA_CONTROL_REPLY = 0x9300,
+    ARTNET_OP_TIME_CODE = 0x9700,
+    ARTNET_OP_TIME_SYNC = 0x9800,
+    ARTNET_OP_TRIGGER = 0x9900,
+    ARTNET_OP_DIRECTORY = 0x9A00,
+    ARTNET_OP_DIRECTORY_REPLY = 0x9B00,
+} artnet_op_t;
+
+uint8_t ip4_address[4] = {0};
+
 
 static void artnet_task(void* pvParameters) {
     char                rx_buffer[1024];
@@ -201,7 +261,6 @@ static void artnet_task(void* pvParameters) {
         socklen_t               socklen = sizeof(source_addr);
 
         while (1) {
-            // ESP_LOGI(TAG, "Waiting for data");
             int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0, (struct sockaddr*)&source_addr, &socklen);
 
             // Error occurred during receiving
@@ -209,14 +268,6 @@ static void artnet_task(void* pvParameters) {
                 ESP_LOGE(TAG, "recvfrom failed: errno %d", errno);
                 if (errno == 11) {           // Timeout
                     set_all_leds(0x111111);  // White
-                    ESP_LOGI(
-                        TAG,
-                        "IP Address: " IPSTR ", mask: " IPSTR ", gateway: " IPSTR,
-                        IP2STR(&ip_info->ip),
-                        IP2STR(&ip_info->netmask),
-                        IP2STR(&ip_info->gw)
-                    );
-                    continue;
                 }
                 break;
             }
@@ -229,65 +280,110 @@ static void artnet_task(void* pvParameters) {
                     inet6_ntoa_r(((struct sockaddr_in6*)&source_addr)->sin6_addr, addr_str, sizeof(addr_str) - 1);
                 }
 
-                rx_buffer[len] = 0;  // Null-terminate whatever we received and treat like a string...
-                // ESP_LOGI(TAG, "Received %d bytes from %s:", len, addr_str);
-                // ESP_LOGI(TAG, "%s", rx_buffer);
-
-                if (len < 18) {
-                    ESP_LOGW(TAG, "Ignored too-short Art-Net packet");
+                if (len < 9 || memcmp("Art-Net\0", rx_buffer, 7)) {
+                    // Invalid magic or simply too short to be a valid Art-Net packet
                     continue;
                 }
-
-                if (memcmp("Art-Net\0", rx_buffer, 7)) {
-                    ESP_LOGW(TAG, "Ignored Art-Net packet with invalid magic");
-                    continue;
-                }
-
                 uint16_t opcode = (rx_buffer[9] << 8) | rx_buffer[8];
 
-                if (opcode != 0x5000) {
-                    ESP_LOGW(TAG, "Ignored non-DMX Art-Net packet");
-                    continue;
+                switch (opcode) {
+                    case ARTNET_OP_POLL: {
+                        if (len < 14) {
+                            ESP_LOGW(TAG, "Ignored too-short Art-Net poll packet");
+                            continue;
+                        }
+                        uint16_t protocol_version = (rx_buffer[10] << 8) | rx_buffer[11];
+                        uint8_t flags = rx_buffer[12];
+                        uint8_t diag_priority = rx_buffer[13];
+
+                        ESP_LOGI(TAG, "Art-Net poll received version %04X flags %02X diag %02X", protocol_version, flags, diag_priority);
+
+                        char portName[18] = "WHYLight";
+                        char longName[64] = "WHYLight";
+                        char nodeReport[64] = "Hello world! This field should contain a report... :D";
+
+                        uint8_t reply[207 + 32] = {'A', 'r', 't', '-', 'N', 'e', 't', 0x00};
+                        reply[8] = ARTNET_OP_POLL_REPLY & 0xFF;
+                        reply[9] = (ARTNET_OP_POLL_REPLY >> 8) & 0xFF;
+                        reply[10] = ip4_address[0];
+                        reply[11] = ip4_address[1];
+                        reply[12] = ip4_address[2];
+                        reply[13] = ip4_address[3];
+                        reply[14] = ARTNET_PORT & 0xFF;
+                        reply[15] = (ARTNET_PORT >> 8) &0xFF;
+                        reply[16] = 0; // Version Hi
+                        reply[17] = 1; // Version Lo
+                        reply[18] = 0; // NetSwitch
+                        reply[19] = 0; // SubSwitch
+                        reply[20] = 0; // OemHi
+                        reply[21] = 0; // OemLo
+                        reply[22] = 0; // UbeaVersion
+                        reply[23] = 0b11000000; // Status1
+                        reply[24] = 0; // EstaManLo
+                        reply[25] = 0; // EstaManHi
+                        memcpy(&reply[26], portName, 18);
+                        memcpy(&reply[44], longName, 64);
+                        memcpy(&reply[108], nodeReport, 64);
+                        reply[172] = 0; // numPortsHi
+                        reply[173] = 1; // numPortsLo
+                        reply[174] = 0b10000000; // portTypes[0]
+                        reply[175] = 0b00000000; // portTypes[1]
+                        reply[176] = 0b00000000; // portTypes[2]
+                        reply[177] = 0b00000000; // portTypes[3]
+                        reply[178] = 0; // goodInput[0]
+                        reply[179] = 0; // goodInput[1]
+                        reply[180] = 0; // goodInput[2]
+                        reply[181] = 0; // goodInput[3]
+                        reply[182] = 0b10000000; // goodOutput[0]
+                        reply[183] = 0b00000000; // goodOutput[1]
+                        reply[184] = 0b00000000; // goodOutput[2]
+                        reply[185] = 0b00000000; // goodOutput[3]
+                        reply[186] = 0; // swIn[0]
+                        reply[187] = 0; // swIn[1]
+                        reply[188] = 0; // swIn[2]
+                        reply[189] = 0; // swIn[3]
+                        reply[190] = 0; // swOut[0]
+                        reply[191] = 0; // swOut[1]
+                        reply[192] = 0; // swOut[2]
+                        reply[193] = 0; // swOut[3]
+                        reply[194] = 0; // acnPriority
+                        reply[195] = 0; // swMacro
+                        reply[196] = 0; // swRemote
+                        // spare 3x
+                        reply[200] = 0; // style
+                        memcpy(&reply[201], w5500_mac_addr, sizeof(w5500_mac_addr));
+
+                        int err = sendto(sock, reply, sizeof(reply), 0, (struct sockaddr *)&source_addr, sizeof(source_addr));
+                        if (err < 0) {
+                            ESP_LOGE(TAG, "Error occurred during sending poll reply: errno %d", errno);
+                            break;
+                        }
+                        break;
+                    }
+                    case ARTNET_OP_OP_OUTPUT: {
+                        if (len < 18) {
+                            ESP_LOGW(TAG, "Ignored too-short Art-Net output packet");
+                            continue;
+                        }
+
+                        uint16_t protocol_version = (rx_buffer[10] << 8) | rx_buffer[11];
+
+                        if (protocol_version != 14) {
+                            ESP_LOGW(TAG, "Ignored Art-Net packet with invalid version");
+                            continue;
+                        }
+
+                        uint8_t  sequence = rx_buffer[12];
+                        uint8_t  physical = rx_buffer[13];
+                        uint16_t universe = (rx_buffer[15] << 8) | rx_buffer[14];
+                        uint16_t length   = (rx_buffer[16] << 8) | rx_buffer[17];
+
+                        set_leds(sequence, physical, universe, (uint8_t*) &rx_buffer[18], length);
+                        break;
+                    }
+                    default:
+                        ESP_LOGW(TAG, "Ignored Art-Net packet with opcode %04x", opcode);
                 }
-
-                uint16_t protocol_version = (rx_buffer[10] << 8) | rx_buffer[11];
-
-                if (protocol_version != 14) {
-                    ESP_LOGW(TAG, "Ignored Art-Net packet with invalid version");
-                    continue;
-                }
-
-                uint8_t  sequence = rx_buffer[12];
-                uint8_t  physical = rx_buffer[13];
-                uint16_t universe = (rx_buffer[15] << 8) | rx_buffer[14];
-                uint16_t length   = (rx_buffer[16] << 8) | rx_buffer[17];
-
-                // printf("Art-Net sequence %u, physical %u, universe %u, length %u\r\n", sequence, physical, universe,
-                // length);
-
-                if (length > sizeof(led_data)) {
-                    // ESP_LOGW(TAG, "Limited Art-Net data length to %u from %u", sizeof(led_data), length);
-                    length = sizeof(led_data);
-                }
-
-                memcpy(led_data, &rx_buffer[18], length);
-                for (int i = 0; i < sizeof(led_data); i++) {
-                    // led_data[i] = led_data[i] / 2;
-                }
-                for (int i = 0; i < sizeof(led_data) / 3; i++) {
-                    uint8_t r           = led_data[i * 3 + 0];
-                    uint8_t g           = led_data[i * 3 + 1];
-                    led_data[i * 3 + 0] = g;
-                    led_data[i * 3 + 1] = r;
-                }
-
-                ledstrip_send(&ledstrip, led_data, sizeof(led_data));
-
-                /*int err = sendto(sock, rx_buffer, len, 0, (struct sockaddr *)&source_addr, sizeof(source_addr));
-                if (err < 0) {
-                    ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
-                    break;
-                }*/
             }
         }
 
@@ -303,17 +399,19 @@ static void artnet_task(void* pvParameters) {
 /** Event handler for IP_EVENT_ETH_GOT_IP */
 static void got_ip_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
     ip_event_got_ip_t* event = (ip_event_got_ip_t*)event_data;
-    ip_info                  = &event->ip_info;
+    const esp_netif_ip_info_t* ip_info = &event->ip_info;
 
     ESP_LOGI(
         TAG,
-        "Ethernet Got IP Address: " IPSTR ", mask: " IPSTR ", gateway: " IPSTR,
+        "Ethernet Got IPv4 address: " IPSTR ", mask: " IPSTR ", gateway: " IPSTR,
         IP2STR(&ip_info->ip),
         IP2STR(&ip_info->netmask),
         IP2STR(&ip_info->gw)
     );
 
     ESP_ERROR_CHECK(set_all_leds(0x001100));  // Set all LEDs to green
+
+    memcpy(ip4_address, &ip_info->ip, sizeof(ip4_address));
 }
 
 void app_main(void) {
