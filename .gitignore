@@ -1,0 +1,12 @@
+build
+main/build
+sdkconfig.old
+*.bak
+*.old
+tools/__pycache__
+.cache
+esp-idf
+esp-idf-tools
+esp-idf-python
+dependencies.lock
+*Zone.Identifier
