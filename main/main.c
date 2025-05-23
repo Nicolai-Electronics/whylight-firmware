@@ -36,6 +36,12 @@
 
 static const char* TAG = "main";
 
+typedef enum {
+    ETHERNET_LED_OFF = 0,
+    ETHERNET_LED_GREEN = 1,
+    ETHERNET_LED_RED = 2,
+} ethernet_led_color_t;
+
 // Configuration for ledstrip driver
 static ledstrip_t ledstrip = {
     .pin = 20,
@@ -113,6 +119,34 @@ esp_err_t set_all_leds(uint32_t color) {
     return ledstrip_send(&ledstrip, led_data, sizeof(led_data));
 }
 
+
+esp_err_t ethernet_led_initialize(void) {
+    gpio_config_t lcd_reset_conf = {
+        .pin_bit_mask = BIT64(19) | BIT64(22),
+        .mode         = GPIO_MODE_INPUT_OUTPUT,
+        .pull_up_en   = 0,
+        .pull_down_en = 0,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+
+    return gpio_config(&lcd_reset_conf);
+}
+
+void ethernet_led_set(ethernet_led_color_t color) {
+    gpio_set_level(19, false);
+    gpio_set_level(22, false);
+    switch (color) {
+        case ETHERNET_LED_GREEN:
+            gpio_set_level(19, true);
+            break;
+        case ETHERNET_LED_RED:
+            gpio_set_level(22, true);
+            break;
+        default:
+            break;
+    }
+}
+
 static void eth_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
     uint8_t          mac_addr[6] = {0};
     /* we can get the ethernet driver handle from event data */
@@ -133,10 +167,12 @@ static void eth_event_handler(void* arg, esp_event_base_t event_base, int32_t ev
                 mac_addr[5]
             );
             ESP_ERROR_CHECK(set_all_leds(0x000011));  // Set all LEDs to blue
+            ethernet_led_set(ETHERNET_LED_GREEN);
             break;
         case ETHERNET_EVENT_DISCONNECTED:
             ESP_LOGI(TAG, "Ethernet Link Down");
             ESP_ERROR_CHECK(set_all_leds(0x110000));  // Set all LEDs to red
+            ethernet_led_set(ETHERNET_LED_RED);
             break;
         case ETHERNET_EVENT_START: ESP_LOGI(TAG, "Ethernet Started"); break;
         case ETHERNET_EVENT_STOP: ESP_LOGI(TAG, "Ethernet Stopped"); break;
@@ -421,6 +457,10 @@ void app_main(void) {
 
     // Initialize GPIO ISR handler
     ESP_ERROR_CHECK(gpio_install_isr_service(0));
+
+    // Initialize ethernet port LED
+    ESP_ERROR_CHECK(ethernet_led_initialize());
+    ethernet_led_set(ETHERNET_LED_RED);
 
     // Initialize LED strip
     ESP_ERROR_CHECK(ledstrip_init(&ledstrip));
